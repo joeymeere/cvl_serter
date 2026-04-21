@@ -1,7 +1,11 @@
 #ifndef SERTER_INSTRUCTIONS_H
 #define SERTER_INSTRUCTIONS_H
 
-#define IX_DISC_SETUP  0
-#define IX_DISC_ASSERT 1
+#define IX_DISC_INIT   0
+#define IX_DISC_SETUP  1
+#define IX_DISC_ASSERT 2
+
+#define SCRATCH_SEED      "scratch"
+#define SCRATCH_SEED_LEN  7
 
 #endif /* SERTER_INSTRUCTIONS_H */

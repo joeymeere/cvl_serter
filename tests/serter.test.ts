@@ -8,6 +8,7 @@ import {
   AccountRole,
   address,
   getAddressEncoder,
+  getProgramDerivedAddress,
   type Address,
   appendTransactionMessageInstructions,
   compileTransaction,
@@ -33,12 +34,15 @@ const SYSVAR_INSTRUCTIONS = address(
   "Sysvar1nstructions1111111111111111111111111"
 );
 
-const IX_SETUP = 0;
-const IX_ASSERT = 1;
+const IX_INIT = 0;
+const IX_SETUP = 1;
+const IX_ASSERT = 2;
 
 const TOKEN_ACCOUNT_LEN = 165;
 const MINT_LEN = 82;
 const TOKEN_IX_MINT_TO = 7;
+
+const SCRATCH_SEED = new TextEncoder().encode("scratch");
 
 const encoder = getAddressEncoder();
 
@@ -49,12 +53,12 @@ function pubkeyBytes(a: Address): Uint8Array {
 function mintAccountData(mintAuthority: Address, decimals = 6): Uint8Array {
   const data = new Uint8Array(MINT_LEN);
   const dv = new DataView(data.buffer);
-  dv.setUint32(0, 1, true); // mint_authority_option = Some
+  dv.setUint32(0, 1, true);
   data.set(pubkeyBytes(mintAuthority), 4);
-  dv.setBigUint64(36, 0n, true); // supply
+  dv.setBigUint64(36, 0n, true);
   data[44] = decimals;
-  data[45] = 1; // is_initialized
-  dv.setUint32(46, 0, true); // freeze_authority_option = None
+  data[45] = 1;
+  dv.setUint32(46, 0, true);
   return data;
 }
 
@@ -67,7 +71,7 @@ function tokenAccountData(
   data.set(pubkeyBytes(mint), 0);
   data.set(pubkeyBytes(owner), 32);
   new DataView(data.buffer).setBigUint64(64, amount, true);
-  data[108] = 1; // initialized
+  data[108] = 1;
   return data;
 }
 
@@ -118,13 +122,15 @@ describe("serter", () => {
   let mintAddr: Address;
   let ownerAddr: Address;
   let tokenAcctAddr: Address;
-  let scratchKeys: CryptoKeyPair;
+
   let scratchAddr: Address;
+  let scratchBump: number;
 
   let lastResult: TransactionMetadata | FailedTransactionMetadata | undefined;
 
   beforeEach(async () => {
     lastResult = undefined;
+
     const programKeys = await generateKeyPair();
     programId = await getAddressFromPublicKey(programKeys.publicKey);
 
@@ -144,8 +150,30 @@ describe("serter", () => {
     const taKeys = await generateKeyPair();
     tokenAcctAddr = await getAddressFromPublicKey(taKeys.publicKey);
 
-    scratchKeys = await generateKeyPair();
-    scratchAddr = await getAddressFromPublicKey(scratchKeys.publicKey);
+    const [pda, bump] = await getProgramDerivedAddress({
+      programAddress: programId,
+      seeds: [SCRATCH_SEED, pubkeyBytes(payerAddr)],
+    });
+    scratchAddr = pda;
+    scratchBump = bump;
+  });
+
+  afterEach(function () {
+    if (!lastResult) return;
+    const failed = lastResult instanceof FailedTransactionMetadata;
+    const meta = failed
+      ? (lastResult as FailedTransactionMetadata).meta()
+      : (lastResult as TransactionMetadata);
+    const status = failed
+      ? `FAIL (${(lastResult as FailedTransactionMetadata).err().toString()})`
+      : "OK";
+    const cu = meta.computeUnitsConsumed();
+    const logs = meta.logs();
+    // eslint-disable-next-line no-console
+    console.log(
+      `\n  ── ${this.currentTest?.title ?? ""} ──\n  status: ${status}` +
+        `\n  cu: ${cu}\n  logs:\n${logs.map((l) => `    ${l}`).join("\n")}\n`
+    );
   });
 
   function seedMint() {
@@ -163,11 +191,27 @@ describe("serter", () => {
     svm.setAccount({
       address: tokenAcctAddr,
       lamports: lamports(2_039_280n),
-      data: tokenAccountData(mintAddr, ownerAddr, amount) as unknown as Uint8Array,
+      data: tokenAccountData(
+        mintAddr,
+        ownerAddr,
+        amount
+      ) as unknown as Uint8Array,
       programAddress: ownerKey,
       executable: false,
       space: BigInt(TOKEN_ACCOUNT_LEN),
     });
+  }
+
+  function initIx(): Instruction {
+    return {
+      programAddress: programId,
+      accounts: [
+        { address: payerAddr, role: AccountRole.WRITABLE_SIGNER },
+        { address: scratchAddr, role: AccountRole.WRITABLE },
+        { address: SYSTEM_PROGRAM, role: AccountRole.READONLY },
+      ],
+      data: new Uint8Array([IX_INIT, scratchBump]),
+    };
   }
 
   function setupIx(tokenAcct: Address = tokenAcctAddr): Instruction {
@@ -176,9 +220,8 @@ describe("serter", () => {
       accounts: [
         { address: payerAddr, role: AccountRole.WRITABLE_SIGNER },
         { address: tokenAcct, role: AccountRole.READONLY },
-        { address: scratchAddr, role: AccountRole.WRITABLE_SIGNER },
+        { address: scratchAddr, role: AccountRole.WRITABLE },
         { address: SYSVAR_INSTRUCTIONS, role: AccountRole.READONLY },
-        { address: SYSTEM_PROGRAM, role: AccountRole.READONLY },
       ],
       data: new Uint8Array([IX_SETUP]),
     };
@@ -199,55 +242,69 @@ describe("serter", () => {
   async function send(
     signers: CryptoKeyPair[],
     ixs: Instruction[]
-  ) {
+  ): Promise<TransactionMetadata | FailedTransactionMetadata> {
     const tx = await buildTx(svm, payerAddr, signers, ixs);
     lastResult = svm.sendTransaction(tx);
     return lastResult;
   }
 
-  afterEach(function () {
-    if (!lastResult) return;
-    const failed = lastResult instanceof FailedTransactionMetadata;
-    const meta = failed
-      ? (lastResult as FailedTransactionMetadata).meta()
-      : (lastResult as TransactionMetadata);
-    const status = failed
-      ? `FAIL (${(lastResult as FailedTransactionMetadata).err().toString()})`
-      : "OK";
-    const cu = meta.computeUnitsConsumed();
-    const logs = meta.logs();
-    // eslint-disable-next-line no-console
-    console.log(
-      `\n  ── ${this.currentTest?.title ?? ""} ──\n  status: ${status}` +
-        `\n  cu: ${cu}\n  logs:\n${logs.map((l) => `    ${l}`).join("\n")}\n`
-    );
+  async function runInit() {
+    const res = await send([payerKeys], [initIx()]);
+    if (res instanceof FailedTransactionMetadata) {
+      throw new Error(`init failed: ${res.toString()}`);
+    }
+  }
+
+  it("init creates the scratch PDA", async () => {
+    await runInit();
+    const s = svm.getAccount(scratchAddr);
+    expect(s.exists).to.be.true;
+  });
+
+  it("init called twice fails (account already exists)", async () => {
+    await runInit();
+
+    const sinkKeys = await generateKeyPair();
+    const sinkAddr = await getAddressFromPublicKey(sinkKeys.publicKey);
+    const transferData = new Uint8Array(12);
+    new DataView(transferData.buffer).setUint32(0, 2, true);
+    new DataView(transferData.buffer).setBigUint64(4, 1_000_000n, true);
+    const transferIx: Instruction = {
+      programAddress: SYSTEM_PROGRAM,
+      accounts: [
+        { address: payerAddr, role: AccountRole.WRITABLE_SIGNER },
+        { address: sinkAddr, role: AccountRole.WRITABLE },
+      ],
+      data: transferData,
+    };
+
+    const res = await send([payerKeys], [transferIx, initIx()]);
+    expect(res).to.be.instanceOf(FailedTransactionMetadata);
   });
 
   it("setup fails when no assert ix follows", async () => {
+    await runInit();
     seedTokenAccount(100n);
-    const res = await send([payerKeys, scratchKeys], [setupIx()]);
+    const res = await send([payerKeys], [setupIx()]);
     expect(res).to.be.instanceOf(FailedTransactionMetadata);
   });
 
   it("setup fails when the token account is not owned by the token program", async () => {
+    await runInit();
     seedTokenAccount(100n, SYSTEM_PROGRAM);
-    const res = await send(
-      [payerKeys, scratchKeys],
-      [setupIx(), assertIx()]
-    );
+    const res = await send([payerKeys], [setupIx(), assertIx()]);
     expect(res).to.be.instanceOf(FailedTransactionMetadata);
   });
 
   it("assert fails when the balance did not increase", async () => {
+    await runInit();
     seedTokenAccount(100n);
-    const res = await send(
-      [payerKeys, scratchKeys],
-      [setupIx(), assertIx()]
-    );
+    const res = await send([payerKeys], [setupIx(), assertIx()]);
     expect(res).to.be.instanceOf(FailedTransactionMetadata);
   });
 
   it("assert fails when the token account passed differs from setup", async () => {
+    await runInit();
     seedTokenAccount(100n);
 
     const otherKeys = await generateKeyPair();
@@ -255,40 +312,53 @@ describe("serter", () => {
     svm.setAccount({
       address: otherAddr,
       lamports: lamports(2_039_280n),
-      data: tokenAccountData(mintAddr, ownerAddr, 100n) as unknown as Uint8Array,
+      data: tokenAccountData(
+        mintAddr,
+        ownerAddr,
+        100n
+      ) as unknown as Uint8Array,
       programAddress: TOKEN_PROGRAM,
       executable: false,
       space: BigInt(TOKEN_ACCOUNT_LEN),
     });
 
     const res = await send(
-      [payerKeys, scratchKeys],
+      [payerKeys],
       [setupIx(tokenAcctAddr), assertIx(otherAddr)]
     );
     expect(res).to.be.instanceOf(FailedTransactionMetadata);
   });
 
-  it("assert alone (no prior setup) fails", async () => {
+  it("assert alone (no prior setup in this tx) fails on zeroed scratch", async () => {
+    await runInit();
     seedTokenAccount(100n);
     const res = await send([payerKeys], [assertIx()]);
     expect(res).to.be.instanceOf(FailedTransactionMetadata);
   });
 
-  it("setup + mint_to + assert succeeds and closes scratch", async () => {
+  it("setup + mint_to + assert succeeds and leaves scratch reusable", async () => {
+    await runInit();
     seedMint();
     seedTokenAccount(100n);
 
+    const before = svm.getAccount(scratchAddr);
+    if (!before.exists) throw new Error("scratch missing after init");
+    const scratchLamportsBefore = before.lamports;
+
     const res = await send(
-      [payerKeys, scratchKeys],
+      [payerKeys],
       [setupIx(), mintToIx(mintAddr, tokenAcctAddr, payerAddr, 50n), assertIx()]
     );
-    expect(res, (res as FailedTransactionMetadata).toString?.()).not.to.be
-      .instanceOf(FailedTransactionMetadata);
-
-    const scratch = svm.getAccount(scratchAddr);
-    if (scratch.exists) {
-      expect(scratch.lamports).to.equal(0n);
+    if (res instanceof FailedTransactionMetadata) {
+      throw new Error(res.toString());
     }
+
+    const after = svm.getAccount(scratchAddr);
+    if (!after.exists) throw new Error("scratch was closed unexpectedly");
+    expect(after.lamports).to.equal(scratchLamportsBefore);
+
+    const data = after.data as Uint8Array;
+    expect([...data.slice(0, 40)].every((b) => b === 0)).to.equal(true);
 
     const ta = svm.getAccount(tokenAcctAddr);
     if (!ta.exists) throw new Error("token account missing");
@@ -300,7 +370,39 @@ describe("serter", () => {
     expect(amount).to.equal(150n);
   });
 
+  it("scratch PDA can be reused across multiple setup/assert cycles", async () => {
+    await runInit();
+    seedMint();
+    seedTokenAccount(100n);
+
+    const r1 = await send(
+      [payerKeys],
+      [setupIx(), mintToIx(mintAddr, tokenAcctAddr, payerAddr, 50n), assertIx()]
+    );
+    if (r1 instanceof FailedTransactionMetadata) throw new Error(r1.toString());
+
+    const r2 = await send(
+      [payerKeys],
+      [
+        setupIx(),
+        mintToIx(mintAddr, tokenAcctAddr, payerAddr, 100n),
+        assertIx(),
+      ]
+    );
+    if (r2 instanceof FailedTransactionMetadata) throw new Error(r2.toString());
+
+    const ta = svm.getAccount(tokenAcctAddr);
+    if (!ta.exists) throw new Error("token account missing");
+    const bytes = ta.data as Uint8Array;
+    const amount = new DataView(bytes.buffer, bytes.byteOffset).getBigUint64(
+      64,
+      true
+    );
+    expect(amount).to.equal(250n);
+  });
+
   it("setup finds the assert ix even when non-adjacent", async () => {
+    await runInit();
     seedMint();
     seedTokenAccount(100n);
 
@@ -320,7 +422,7 @@ describe("serter", () => {
     };
 
     const res = await send(
-      [payerKeys, scratchKeys],
+      [payerKeys],
       [
         setupIx(),
         transferIx,
